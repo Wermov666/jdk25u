@@ -1,0 +1,613 @@
+#
+# Multiplatform Release Build (custom, additive to upstream CI — does NOT modify any upstream workflow) [jdk25u]
+#
+# Supported/experimental targets (see reports/gha-multiplatform-audit-2026-11-17.md):
+#   windows-x64        supported  : windows-2022, MSVC 14.44, boot JDK = official conf (Temurin)
+#   #   linux-x64          supported  : ubuntu-22.04, gcc-10, glibc >= 2.35
+#   #   linux-x64-musl     supported* : alpine:3.20 container, boot JDK = Adoptium alpine-x64 (*self-maintained, upstream has no 21u alpine conf)
+#   #   macos-x64          supported  : macos-15 (Apple Silicon, x86_64 cross via --openjdk-target), Xcode 16.4
+#   macos-aarch64      supported  : macos-15, Xcode 16.4
+#
+# Triggers:
+#   push to master      -> artifacts only (no release)
+#   push tag jdk-release-* -> artifacts + GitHub Release
+#   workflow_dispatch   -> filter by platforms/archs/ref, optional jtreg, optional release
+#
+# Artifacts: OpenJDK-{version}-{platform}-{architecture}-{abi} (.zip on Windows, .tar.gz elsewhere)
+#            plus manifest.json and SHA256 checksum, per platform.
+#
+
+name: 'Multiplatform Release Build'
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'jdk-release-*' ]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms (comma separated or "all"): windows-x64, linux-x64, linux-x64-musl, macos-x64, macos-aarch64'
+        required: false
+        default: 'all'
+      archs:
+        description: 'Architecture filter: all | x64 | aarch64'
+        required: false
+        default: 'all'
+      ref:
+        description: 'Git ref to build (branch or tag, empty = default branch)'
+        required: false
+        default: ''
+      debug-level:
+        description: 'Debug level: release | fastdebug'
+        required: false
+        default: 'release'
+      include-experimental:
+        description: 'Include experimental platforms, if any'
+        type: boolean
+        required: false
+        default: true
+      run-jtreg:
+        description: 'Run jtreg tier1 after build (Linux glibc / macOS / Windows x64 only)'
+        type: boolean
+        required: false
+        default: false
+      create-release:
+        description: 'Create a GitHub Release with all artifacts'
+        type: boolean
+        required: false
+        default: false
+      release-tag:
+        description: 'Release tag (only used with create-release; empty = jdk-release-build-<run_number>)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: multiplatform-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ###############################################################################
+  ## Prepare: build the platform matrix from inputs
+  ###############################################################################
+  prepare:
+    name: 'Prepare matrix'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      should-release: ${{ steps.matrix.outputs.should-release }}
+    steps:
+      - name: 'Compute matrix'
+        id: matrix
+        shell: python3 {0}
+        env:
+          INPUT_PLATFORMS: ${{ github.event.inputs.platforms }}
+          INPUT_ARCHS: ${{ github.event.inputs.archs }}
+          INPUT_INCLUDE_EXPERIMENTAL: ${{ github.event.inputs.include-experimental }}
+          INPUT_CREATE_RELEASE: ${{ github.event.inputs.create-release }}
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          import json, os
+
+          def inp(name, default):
+              v = os.environ.get(name, '').strip()
+              return v if v else default
+
+          platforms = inp('INPUT_PLATFORMS', 'all')
+          archs = inp('INPUT_ARCHS', 'all')
+          include_exp = inp('INPUT_INCLUDE_EXPERIMENTAL', 'true').lower() == 'true'
+          create_release = inp('INPUT_CREATE_RELEASE', 'false').lower() == 'true'
+          event = os.environ.get('EVENT_NAME', '')
+          ref = os.environ.get('GIT_REF', '')
+
+          plats = None if platforms == 'all' else {p.strip() for p in platforms.split(',') if p.strip()}
+          arcs = None if archs == 'all' else {a.strip() for a in archs.split(',') if a.strip()}
+
+          M = []
+          def add(**e):
+              M.append(e)
+
+          # --- Windows x64 (msvc) : supported ---
+          add(id='windows-x64', os='windows', arch='x64', abi='msvc',
+              runner='windows-2022', container='', experimental=False,
+              bootjdk_mode='conf', bootjdk_arg='windows-x64',
+              msvc='14.44', msvc_arch='x86.x64', xcode='', gcc='',
+              extra_conf='', verified_run=True, ext='zip', glibc_min='', musl_version='',
+              timeout=360)
+          # --- Linux x64 glibc (>= 2.35) : supported ---
+          add(id='linux-x64', os='linux', arch='x64', abi='glibc2.35',
+              runner='ubuntu-22.04', container='', experimental=False,
+              bootjdk_mode='conf', bootjdk_arg='linux-x64',
+              msvc='', msvc_arch='', xcode='', gcc='10',
+              extra_conf='', verified_run=True, ext='tar.gz', glibc_min='2.35', musl_version='',
+              timeout=300)
+          # --- Linux x64 musl (alpine 3.20, musl 1.2.5) : supported (self-maintained) ---
+          add(id='linux-x64-musl', os='linux', arch='x64', abi='musl',
+              runner='ubuntu-24.04', container='alpine:3.20', experimental=False,
+              bootjdk_mode='conf', bootjdk_arg='alpine-linux-x64',
+              msvc='', msvc_arch='', xcode='', gcc='',
+              extra_conf='--with-external-symbols-in-bundles=none --with-native-debug-symbols-level=1',
+              verified_run=True, ext='tar.gz', glibc_min='', musl_version='1.2.5',
+              timeout=300)
+          # --- macOS x64 : supported (PERF-CUSTOM: x86_64 cross-compiled on free macos-15 arm64 runner; Intel runner is paid-only) ---
+          add(id='macos-x64', os='macos', arch='x64', abi='macos',
+              runner='macos-15', container='', experimental=False,
+              bootjdk_mode='adoptium', bootjdk_arg='25;mac;aarch64',
+              msvc='', msvc_arch='', xcode='16.4', gcc='',
+              extra_conf='--openjdk-target=x86_64-apple-darwin', verified_run=True, ext='tar.gz', glibc_min='', musl_version='',
+              timeout=300)
+          # --- macOS aarch64 (Apple Silicon) : supported ---
+          add(id='macos-aarch64', os='macos', arch='aarch64', abi='macos',
+              runner='macos-15', container='', experimental=False,
+              bootjdk_mode='conf', bootjdk_arg='macos-aarch64',
+              msvc='', msvc_arch='', xcode='16.4', gcc='',
+              extra_conf='', verified_run=True, ext='tar.gz', glibc_min='', musl_version='',
+              timeout=300)
+
+          keep = []
+          for e in M:
+              if plats is not None and e['id'] not in plats:
+                  continue
+              if arcs is not None and e['arch'] not in arcs:
+                  continue
+              if e['experimental'] and not include_exp:
+                  continue
+              # Human-readable toolchain description for the manifest
+              if e['os'] == 'windows':
+                  e['toolchain_display'] = 'MSVC %s (Visual Studio 2022)' % e['msvc']
+              elif e['os'] == 'macos':
+                  e['toolchain_display'] = 'Xcode %s (clang)' % e['xcode']
+              elif e['container']:
+                  e['toolchain_display'] = 'gcc (alpine-sdk, alpine 3.20, musl)'
+              else:
+                  e['toolchain_display'] = 'gcc %s' % e['gcc']
+              keep.append(e)
+
+          should_release = False
+          if event == 'push' and ref.startswith('refs/tags/jdk-release-'):
+              should_release = True
+          if event == 'workflow_dispatch' and create_release:
+              should_release = True
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('matrix=' + json.dumps(keep, separators=(',', ':')) + '\n')
+              f.write('should-release=' + ('true' if should_release else 'false') + '\n')
+
+  ###############################################################################
+  ## Build (one job per platform, fail-fast disabled)
+  ###############################################################################
+  build:
+    name: 'build-${{ matrix.id }}'
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '[]'
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Needed for MSYS2 bash on Windows (harmless elsewhere)
+      MSYS2_PATH_TYPE: minimal
+      CHERE_INVOKING: 1
+    steps:
+      - name: 'Checkout the JDK source'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 1
+
+      ###########################################################################
+      ## Toolchain installation (per OS)
+      ###########################################################################
+      - name: 'Free disk space (Windows)'
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          df -h / || true
+          rm -rf /c/hostedtoolcache/windows/CodeQL || true
+          df -h /
+
+      - name: 'Free disk space (Linux glibc)'
+        if: matrix.os == 'linux' && matrix.container == ''
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: 'Install toolchain and dependencies (Linux glibc)'
+        if: matrix.os == 'linux' && matrix.container == ''
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install gcc-${{ matrix.gcc }} g++-${{ matrix.gcc }} \
+            libxrandr-dev libxtst-dev libcups2-dev libasound2-dev \
+            libfontconfig1-dev libx11-dev libxext-dev libxrender-dev libxt-dev libfreetype6-dev
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${{ matrix.gcc }} 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${{ matrix.gcc }}
+
+      - name: 'Install toolchain and dependencies (musl/alpine)'
+        if: matrix.container != ''
+        shell: sh
+        run: |
+          apk update
+          apk add bash alpine-sdk autoconf curl wget zip unzip \
+            alsa-lib-dev cups-dev cups-libs fontconfig-dev freetype-dev grep \
+            libx11-dev libxext-dev libxrandr-dev libxrender-dev libxt-dev libxtst-dev linux-headers
+
+      - name: 'Install toolchain (macOS)'
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          brew install autoconf make coreutils
+          sudo xcode-select --switch /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # PERF-CUSTOM: macos-x64 is cross-built; the x86_64 JVM under verification needs Rosetta 2 on Apple Silicon
+      - name: 'Install Rosetta 2 (macos-x64 cross-build)'
+        if: matrix.os == 'macos' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          if /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo 'Rosetta 2 already installed'
+          else
+            echo 'Installing Rosetta 2...'
+            softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: 'Get MSYS2 (Windows)'
+        if: matrix.os == 'windows'
+        uses: ./.github/actions/get-msys2
+
+      - name: 'Check MSVC toolset (Windows)'
+        id: toolchain-check
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set +e
+          '/c/Program Files/Microsoft Visual Studio/2022/Enterprise/vc/auxiliary/build/vcvars64.bat' -vcvars_ver=${{ matrix.msvc }}
+          if [ $? -eq 0 ]; then
+            echo 'toolchain-installed=true' >> $GITHUB_OUTPUT
+          else
+            echo 'toolchain-installed=false' >> $GITHUB_OUTPUT
+          fi
+
+      - name: 'Install MSVC toolset components (Windows)'
+        if: matrix.os == 'windows' && steps.toolchain-check.outputs.toolchain-installed != 'true'
+        shell: bash
+        run: |
+          '/c/Program Files (x86)/Microsoft Visual Studio/Installer/vs_installer.exe' \
+            modify --quiet --installPath 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise' \
+            --add Microsoft.VisualStudio.Component.VC.${{ matrix.msvc }}.${{ matrix.msvc_arch }}
+
+      ###########################################################################
+      ## Boot JDK (three modes: official conf / Adoptium API / Alpine package)
+      ###########################################################################
+      - name: 'Get BootJDK (official conf)'
+        id: bootjdk
+        if: matrix.bootjdk_mode == 'conf'
+        uses: ./.github/actions/get-bootjdk
+        with:
+          platform: ${{ matrix.bootjdk_arg }}
+
+      - name: 'Get BootJDK (Adoptium API)'
+        if: matrix.bootjdk_mode == 'adoptium'
+        id: bootjdk-adoptium
+        shell: bash
+        run: |
+          IFS=';' read -r bver bos barch bextra <<< "${{ matrix.bootjdk_arg }}"
+          if [ "$bextra" = "alpine" ]; then os_seg="alpine"; else os_seg="$bos"; fi
+          mkdir -p bootjdk/jdk bootjdk/unpacked
+          url="https://api.adoptium.net/v3/binary/latest/${bver}/ga/${os_seg}/${barch}/jdk/hotspot/normal/eclipse?project=jdk"
+          echo "Downloading boot JDK: $url"
+          wget -q -O bootjdk/jdk.tar.gz "$url"
+          sha256sum bootjdk/jdk.tar.gz | tee bootjdk/jdk.sha256
+          tar -xf bootjdk/jdk.tar.gz -C bootjdk/unpacked
+          jdk_root="$(dirname "$(find bootjdk/unpacked -name bin -type d | head -1)")"
+          mv "$jdk_root"/* bootjdk/jdk/
+          echo "path=$(pwd)/bootjdk/jdk" >> "$GITHUB_OUTPUT"
+
+      - name: 'Get BootJDK (Alpine distro package)'
+        if: matrix.bootjdk_mode == 'alpine-apk'
+        id: bootjdk-apk
+        shell: sh
+        run: |
+          apk add "openjdk${{ matrix.bootjdk_arg }}-jdk" || apk add "openjdk${{ matrix.bootjdk_arg }}"
+          jreal="$(readlink -f "$(command -v java)")"
+          jhome="$(dirname "$(dirname "$jreal")")"
+          echo "path=$jhome" >> "$GITHUB_OUTPUT"
+          "$jhome/bin/java" -version 2>&1 | head -1
+
+      # Normalize bootjdk path output across the three modes
+      - name: 'Normalize BootJDK path'
+        id: bootjdk-final
+        shell: bash
+        run: |
+          BP=''
+          if [ -n "${{ steps.bootjdk.outputs.path }}" ]; then
+            BP="${{ steps.bootjdk.outputs.path }}"
+          elif [ -n "${{ steps.bootjdk-adoptium.outputs.path }}" ]; then
+            BP="${{ steps.bootjdk-adoptium.outputs.path }}"
+          else
+            BP="${{ steps.bootjdk-apk.outputs.path }}"
+          fi
+          echo "path=$BP" >> "$GITHUB_OUTPUT"
+          mkdir -p build-info
+          "$BP/bin/java" -version 2>&1 | head -1 > build-info/bootjdk-version.txt || true
+          cat build-info/bootjdk-version.txt
+
+      ###########################################################################
+      ## JTReg / GTest (optional, only when run-jtreg is enabled)
+      ###########################################################################
+      - name: 'Get JTReg'
+        id: jtreg
+        if: inputs.run-jtreg == true && matrix.container == ''
+        uses: ./.github/actions/get-jtreg
+
+      - name: 'Get GTest'
+        id: gtest
+        if: inputs.run-jtreg == true && matrix.container == ''
+        uses: ./.github/actions/get-gtest
+
+      ###########################################################################
+      ## Configure
+      ###########################################################################
+      - name: 'Configure (Windows)'
+        if: matrix.os == 'windows'
+        shell: env /usr/bin/bash --login -eo pipefail {0}
+        env:
+          PATH: ''
+        run: |
+          mkdir -p build-info
+          ARGS="--with-conf-name=${{ matrix.id }} \
+            --with-debug-level=${{ inputs.debug-level || 'release' }} \
+            --with-version-opt=${GITHUB_ACTOR}-${GITHUB_SHA} \
+            --with-boot-jdk=${{ steps.bootjdk-final.outputs.path }} \
+            --with-msvc-toolset-version=${{ matrix.msvc }} \
+            --with-jmod-compress=zip-1 \
+            ${{ steps.jtreg.outputs.path != '' && format('--with-jtreg={0}', steps.jtreg.outputs.path) || '' }} \
+            ${{ steps.jtreg.outputs.path != '' && format('--with-gtest={0}', steps.gtest.outputs.path) || '' }} \
+            ${{ matrix.extra_conf }}"
+          echo "$ARGS" | tee build-info/configure-args.txt
+          bash configure $ARGS || (echo 'Dumping config.log:' && cat config.log && exit 1)
+
+      - name: 'Configure (Linux / macOS)'
+        if: matrix.os == 'linux' || matrix.os == 'macos'
+        shell: bash
+        run: |
+          mkdir -p build-info
+          ARGS="--with-conf-name=${{ matrix.id }} \
+            --with-debug-level=${{ inputs.debug-level || 'release' }} \
+            --with-version-opt=${GITHUB_ACTOR}-${GITHUB_SHA} \
+            --with-boot-jdk=${{ steps.bootjdk-final.outputs.path }} \
+            --with-zlib=system \
+            --with-jmod-compress=zip-1 \
+            ${{ steps.jtreg.outputs.path != '' && format('--with-jtreg={0}', steps.jtreg.outputs.path) || '' }} \
+            ${{ steps.jtreg.outputs.path != '' && format('--with-gtest={0}', steps.gtest.outputs.path) || '' }} \
+            ${{ matrix.extra_conf }}"
+          echo "$ARGS" | tee build-info/configure-args.txt
+          bash configure $ARGS || (echo 'Dumping config.log:' && cat config.log && exit 1)
+
+      ###########################################################################
+      ## Build
+      ###########################################################################
+      - name: 'Build'
+        id: build
+        uses: ./.github/actions/do-build
+        with:
+          make-target: 'images'
+          platform: ${{ matrix.id }}
+
+      - name: 'Run jtreg tier1 (optional)'
+        if: inputs.run-jtreg == true && matrix.container == ''
+        shell: bash
+        run: |
+          make test-tier1 LOG=info || bash ./.github/scripts/gen-test-summary.sh "$GITHUB_STEP_SUMMARY"
+
+      ###########################################################################
+      ## Verification: JVM starts, javac works, binary arch + dynamic deps
+      ###########################################################################
+      - name: 'Verify (Linux)'
+        if: matrix.os == 'linux' && matrix.verified_run == true
+        shell: bash
+        run: |
+          IMG="$(ls -d build/*/images/jdk | head -1)"
+          "$IMG/bin/java" -version 2>&1 | tee build-info/java-version.txt
+          printf 'public class Hello { public static void main(String[] a) { System.out.println("Hello, multiplatform build"); } }\n' > Hello.java
+          "$IMG/bin/javac" Hello.java
+          "$IMG/bin/java" Hello | tee build-info/hello.txt
+          grep -q 'Hello, multiplatform' build-info/hello.txt
+          file "$IMG/bin/java" | tee build-info/abi-check.txt
+          (ldd --version 2>&1 | head -1) | tee build-info/libc-info.txt
+          ldd "$IMG/lib/server/libjvm.so" > build-info/deps.txt 2>&1 || true
+          echo 'linux verification passed'
+
+      - name: 'Verify (macOS)'
+        if: matrix.os == 'macos' && matrix.verified_run == true
+        shell: bash
+        run: |
+          IMG="$(ls -d build/*/images/jdk | head -1)"
+          "$IMG/bin/java" -version 2>&1 | tee build-info/java-version.txt
+          printf 'public class Hello { public static void main(String[] a) { System.out.println("Hello, multiplatform build"); } }\n' > Hello.java
+          "$IMG/bin/javac" Hello.java
+          "$IMG/bin/java" Hello | tee build-info/hello.txt
+          grep -q 'Hello, multiplatform' build-info/hello.txt
+          file "$IMG/bin/java" | tee build-info/abi-check.txt
+          # PERF-CUSTOM: assert real Mach-O architecture; pipefail (default bash shell) propagates assert failure
+          python - "$IMG/bin/java" "${{ matrix.arch }}" <<'PY' | tee build-info/macho-arch-check.txt
+          import struct, sys
+          p, arch = sys.argv[1], sys.argv[2]
+          with open(p, 'rb') as f:
+              data = f.read(4096)
+          magic, cputype = struct.unpack_from('<II', data, 0)
+          assert magic == 0xFEEDFACF, 'not a 64-bit Mach-O binary: 0x%X' % magic
+          expect = 0x01000007 if arch == 'x64' else 0x0100000C
+          assert cputype == expect, 'unexpected Mach-O cpu type: 0x%X (expected 0x%X for %s)' % (cputype, expect, arch)
+          print('Mach-O cpu type = 0x%X (%s) OK' % (cputype, arch))
+          PY
+          otool -L "$IMG/lib/server/libjvm.dylib" > build-info/deps.txt 2>&1 || true
+          echo 'macos verification passed'
+
+      - name: 'Verify (Windows, runtime)'
+        if: matrix.os == 'windows' && matrix.verified_run == true
+        shell: bash
+        run: |
+          IMG="$(ls -d build/*/images/jdk | head -1)"
+          "$IMG/bin/java.exe" -version 2>&1 | tee build-info/java-version.txt
+          printf 'public class Hello { public static void main(String[] a) { System.out.println("Hello, multiplatform build"); } }\n' > Hello.java
+          "$IMG/bin/javac.exe" Hello.java
+          "$IMG/bin/java.exe" Hello | tee build-info/hello.txt
+          grep -q 'Hello, multiplatform' build-info/hello.txt
+          ldd "$IMG/bin/java.exe" > build-info/deps.txt 2>&1 || true
+
+      - name: 'Verify (Windows PE architecture)'
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          IMG="$(ls -d build/*/images/jdk | head -1)"
+          python - "${IMG}/bin/java.exe" "${{ matrix.arch }}" <<'PY' | tee build-info/abi-check.txt
+          import struct, sys
+          p, arch = sys.argv[1], sys.argv[2]
+          with open(p, 'rb') as f:
+              data = f.read(4096)
+          off = struct.unpack_from('<I', data, 0x3C)[0]
+          machine = struct.unpack_from('<H', data, off + 4)[0]
+          expect = 0x8664 if arch == 'x64' else 0xAA64
+          assert machine == expect, 'unexpected PE machine: 0x%X' % machine
+          print('PE machine=0x%X (%s) OK' % (machine, arch))
+          PY
+
+      ###########################################################################
+      ## Package: OpenJDK-{version}-{platform}-{architecture}-{abi} + manifest + sha256
+      ###########################################################################
+      - name: 'Package artifact'
+        id: pkg
+        shell: bash
+        env:
+          M_OS: ${{ matrix.os }}
+          M_ARCH: ${{ matrix.arch }}
+          M_ABI: ${{ matrix.abi }}
+          M_GLIBC: ${{ matrix.glibc_min }}
+          M_MUSL: ${{ matrix.musl_version }}
+          M_BOOT_MODE: ${{ matrix.bootjdk_mode }}
+          M_BOOT_SRC: ${{ matrix.bootjdk_arg }}
+          M_TOOLCHAIN: ${{ matrix.toolchain_display }}
+          M_EXPERIMENTAL: ${{ matrix.experimental }}
+          M_VERIFIED: ${{ matrix.verified_run }}
+          M_RUNNER: ${{ matrix.runner }}
+          M_DEBUG: ${{ inputs.debug-level || 'release' }}
+          BOOTJDK_PATH: ${{ steps.bootjdk-final.outputs.path }}
+        run: |
+          IMG="$(ls -d build/*/images/jdk | head -1)"
+          IMGDIR="$(basename "$IMG")"
+          VER="$("$IMG/bin/java" -version 2>&1 | head -1 | sed -E 's/.*version "([^"]+)".*/\1/')"
+          NAME="OpenJDK-${VER}-${M_OS}-${M_ARCH}-${M_ABI}"
+          mkdir -p dist
+          export IMG IMGDIR VER NAME
+          python - <<'PY'
+          import json, os, subprocess
+          img = os.environ['IMG']; imgdir = os.environ['IMGDIR']
+          ver = os.environ['VER']; name = os.environ['NAME']
+          def run(cmd):
+              try:
+                  return subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode(errors='replace').strip()
+              except Exception as e:
+                  return 'unavailable: %s' % e
+          bootver = run([os.path.join(os.environ['BOOTJDK_PATH'], 'bin', 'java'), '-version'])
+          manifest = {
+              'product': 'OpenJDK',
+              'jdk_version': ver,
+              'java_version_string': run([os.path.join(img, 'bin', 'java'), '-version']),
+              'git_commit': os.environ.get('GITHUB_SHA', ''),
+              'git_ref': os.environ.get('GITHUB_REF', ''),
+              'os': os.environ['M_OS'],
+              'architecture': os.environ['M_ARCH'],
+              'abi': os.environ['M_ABI'],
+              'glibc_min': os.environ['M_GLIBC'] or None,
+              'musl_version': os.environ['M_MUSL'] or None,
+              'boot_jdk': {
+                  'mode': os.environ['M_BOOT_MODE'],
+                  'source': os.environ['M_BOOT_SRC'],
+                  'version': bootver.splitlines()[0] if bootver else '',
+              },
+              'toolchain': os.environ.get('M_TOOLCHAIN', ''),
+              'debug_level': os.environ['M_DEBUG'],
+              'configure_args': open('build-info/configure-args.txt').read().strip()
+                  if os.path.exists('build-info/configure-args.txt') else '',
+              'experimental': os.environ['M_EXPERIMENTAL'].lower() == 'true',
+              'runtime_verified': os.environ['M_VERIFIED'].lower() == 'true',
+              'runner': os.environ['M_RUNNER'],
+              'run_id': os.environ.get('GITHUB_RUN_ID', ''),
+              'build_time_utc': subprocess.check_output(
+                  ['date', '-u', '+%Y-%m-%dT%H:%M:%SZ']).decode().strip(),
+          }
+          with open('dist/' + name + '.manifest.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          print(json.dumps(manifest, indent=2))
+          PY
+          if [ "${{ matrix.ext }}" = 'zip' ]; then
+            IMGWIN=$(cygpath -w "$(cd "$IMG" && pwd)")
+            powershell -NoProfile -Command "Compress-Archive -Path (Join-Path '$IMGWIN' '*') -DestinationPath 'dist\\${NAME}.zip' -Force"
+          else
+            tar -czf "dist/${NAME}.tar.gz" -C "$(dirname "$IMG")" "$IMGDIR"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${NAME}.${{ matrix.ext }}" > "dist/${NAME}.sha256"
+          else
+            SUM=$(certutil -hashfile "$(cygpath -w "dist/${NAME}.${{ matrix.ext }}")" SHA256 | sed -n 2p | tr -d ' \r')
+            printf '%s  %s\n' "$SUM" "${NAME}.${{ matrix.ext }}" > "dist/${NAME}.sha256"
+          fi
+          ls -la dist/
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 'Upload artifact'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.manifest.json
+            dist/*.sha256
+
+  ###############################################################################
+  ## Release (only on jdk-release-* tags or explicit dispatch request)
+  ###############################################################################
+  release:
+    name: 'Create GitHub Release'
+    needs: [ prepare, build ]
+    if: needs.prepare.outputs.should-release == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 'Download all platform artifacts'
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 'Create GitHub Release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ github.event.inputs.release-tag }}" ]; then
+            TAG="${{ github.event.inputs.release-tag }}"
+          elif [ -n "${{ github.event.inputs.create-release }}" ] && [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            TAG="jdk-release-build-${{ github.run_number }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          ls -la dist/
+          gh release create "$TAG" dist/* \
+            --title "OpenJDK multi-platform build ${TAG}" \
+            --notes "Automated multi-platform OpenJDK builds. Each platform artifact contains the JDK archive, manifest.json (build metadata) and a SHA256 checksum file."
